@@ -81,28 +81,40 @@ export class VideoService {
   }
 
   async generateAudio(text: string): Promise<{ audio: string; contentType: string }> {
-    const apiKey = this.configService.get<string>('ELEVENLABS_API_KEY');
+    const apiKey = this.configService.get<string>('GOOGLE_CLOUD_TTS_API_KEY');
     if (!apiKey) {
-      throw new Error('ELEVENLABS_API_KEY not configured');
+      throw new Error('GOOGLE_CLOUD_TTS_API_KEY not configured');
     }
 
-    const voiceId = '21m00Tcm4TlvDq8ikWAM';
+    this.logger.log(`Generating audio with Google Cloud TTS (${text.length} characters)`);
 
     const response = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+      `https://texttospeech.googleapis.com/v1/text:synthesize?key=${apiKey}`,
       {
         method: 'POST',
         headers: {
-          Accept: 'audio/mpeg',
           'Content-Type': 'application/json',
-          'xi-api-key': apiKey,
         },
         body: JSON.stringify({
-          text: text,
-          model_id: 'eleven_multilingual_v2',
-          voice_settings: {
-            stability: 0.5,
-            similarity_boost: 0.5,
+          input: {
+            text: text,
+          },
+          voice: {
+            languageCode: 'en-US',
+            name: 'en-US-Neural2-F', // Женский голос, естественный
+            // Другие варианты:
+            // en-US-Neural2-D - Мужской, уверенный
+            // en-US-Neural2-C - Женский, профессиональный
+            // en-US-Neural2-A - Мужской, энергичный
+            // en-GB-Neural2-A - Британский женский
+            // en-GB-Neural2-B - Британский мужской
+            ssmlGender: 'FEMALE', // MALE или FEMALE
+          },
+          audioConfig: {
+            audioEncoding: 'MP3',
+            speakingRate: 1.0, // 0.25-4.0 (скорость речи)
+            pitch: 0.0,        // -20.0 to 20.0 (тон)
+            volumeGainDb: 0.0, // -96.0 to 16.0 (громкость)
           },
         }),
       },
@@ -110,11 +122,19 @@ export class VideoService {
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`ElevenLabs API error: ${response.status} - ${errorText}`);
+      throw new Error(`Google Cloud TTS API error: ${response.status} - ${errorText}`);
     }
 
-    const audioBuffer = await response.arrayBuffer();
-    const audioBase64 = Buffer.from(audioBuffer).toString('base64');
+    const data = await response.json();
+    
+    if (!data.audioContent) {
+      throw new Error('No audio content in response');
+    }
+
+    // Google возвращает base64 напрямую
+    const audioBase64 = data.audioContent;
+
+    this.logger.log(`Audio generated successfully: ${(audioBase64.length * 0.75 / 1024).toFixed(2)} KB`);
 
     return {
       audio: audioBase64,
