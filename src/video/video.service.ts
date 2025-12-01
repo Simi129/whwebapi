@@ -5,6 +5,7 @@ import { AssemblyAI } from 'assemblyai';
 import { createClient } from '@supabase/supabase-js';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegPath from '@ffmpeg-installer/ffmpeg';
+import ffprobePath from '@ffprobe-installer/ffprobe';
 import { writeFile, readFile, unlink, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
@@ -12,6 +13,7 @@ import * as os from 'os';
 import { v4 as uuidv4 } from 'uuid';
 
 ffmpeg.setFfmpegPath(ffmpegPath.path);
+ffmpeg.setFfprobePath(ffprobePath.path);
 
 @Injectable()
 export class VideoService {
