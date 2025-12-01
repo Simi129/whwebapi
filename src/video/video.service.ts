@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { GoogleGenAI } from '@google/genai';
 import { AssemblyAI } from 'assemblyai';
+import { createClient } from '@supabase/supabase-js';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegPath from '@ffmpeg-installer/ffmpeg';
 import { writeFile, readFile, unlink, mkdir } from 'fs/promises';
@@ -15,8 +16,17 @@ ffmpeg.setFfmpegPath(ffmpegPath.path);
 @Injectable()
 export class VideoService {
   private readonly logger = new Logger(VideoService.name);
+  private supabase;
 
-  constructor(private configService: ConfigService) {}
+  constructor(private configService: ConfigService) {
+    // Инициализация Supabase клиента
+    const supabaseUrl = this.configService.get<string>('SUPABASE_URL');
+    const supabaseKey = this.configService.get<string>('SUPABASE_KEY');
+    
+    if (supabaseUrl && supabaseKey) {
+      this.supabase = createClient(supabaseUrl, supabaseKey);
+    }
+  }
 
   async generateScript(prompt: string): Promise<any> {
     const apiKey = this.configService.get<string>('GEMINI_API_KEY');
@@ -214,87 +224,118 @@ export class VideoService {
     }));
   }
 
+  /**
+   * ОПТИМИЗИРОВАННЫЙ МЕТОД: Рендеринг видео по ID
+   * Загружает данные из Supabase вместо получения их в запросе
+   */
+  async renderVideoById(videoId: string): Promise<{ video: string; contentType: string; size: number }> {
+    const sessionId = uuidv4();
+    
+    try {
+      this.logger.log(`[${sessionId}] Starting render for video ID: ${videoId}`);
+
+      if (!this.supabase) {
+        throw new Error('Supabase not configured');
+      }
+
+      // Загружаем данные видео из Supabase
+      this.logger.log(`[${sessionId}] Fetching video data from Supabase...`);
+      const { data: videoData, error } = await this.supabase
+        .from('video_data')
+        .select('*')
+        .eq('id', videoId)
+        .single();
+
+      if (error || !videoData) {
+        throw new Error(`Video not found: ${videoId}`);
+      }
+
+      this.logger.log(`[${sessionId}] Video data loaded: ${videoData.image_list?.length || 0} images, ${videoData.duration}s`);
+
+      // Вызываем стандартный метод рендеринга с данными из БД
+      return await this.renderVideo(
+        videoData.audio_file_url,
+        videoData.image_list || [],
+        videoData.duration || 30,
+        sessionId,
+      );
+    } catch (error) {
+      this.logger.error(`[${sessionId}] Render error for video ${videoId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Стандартный метод рендеринга (для обратной совместимости)
+   */
   async renderVideo(
     audioUrl: string,
     images: string[],
     duration: number,
+    sessionId?: string,
   ): Promise<{ video: string; contentType: string; size: number }> {
-    const sessionId = uuidv4();
-    const tempDir = join(os.tmpdir(), `video-${sessionId}`);
+    const session = sessionId || uuidv4();
+    const tempDir = join(os.tmpdir(), `video-${session}`);
 
     try {
-      this.logger.log(`[${sessionId}] Starting render: ${images.length} images, ${duration}s duration`);
+      this.logger.log(`[${session}] Starting render: ${images.length} images, ${duration}s duration`);
 
       if (!existsSync(tempDir)) {
         await mkdir(tempDir, { recursive: true });
       }
 
-      this.logger.log(`[${sessionId}] Processing audio...`);
+      // Обработка аудио
+      this.logger.log(`[${session}] Processing audio...`);
       const audioPath = join(tempDir, 'audio.mp3');
+      await this.downloadFile(audioUrl, audioPath, session);
 
-      if (this.isDataUrl(audioUrl)) {
-        const audioBuffer = this.decodeDataUrl(audioUrl);
-        await writeFile(audioPath, audioBuffer);
-      } else {
-        const audioResponse = await fetch(audioUrl);
-        if (!audioResponse.ok) {
-          throw new Error(`Failed to download audio: ${audioResponse.status}`);
-        }
-        const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
-        await writeFile(audioPath, audioBuffer);
-      }
-
-      this.logger.log(`[${sessionId}] Processing ${images.length} images...`);
+      // Обработка изображений
+      this.logger.log(`[${session}] Processing ${images.length} images...`);
       const imagePaths: string[] = [];
 
-      for (let i = 0; i < images.length; i++) {
-        const imagePath = join(tempDir, `image_${String(i).padStart(3, '0')}.png`);
-
-        try {
-          if (this.isDataUrl(images[i])) {
-            const imageBuffer = this.decodeDataUrl(images[i]);
-            await writeFile(imagePath, imageBuffer);
-          } else {
-            const imageResponse = await fetch(images[i]);
-            if (!imageResponse.ok) {
-              this.logger.error(`Failed to download image ${i}: ${imageResponse.status}`);
-              continue;
-            }
-            const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
-            await writeFile(imagePath, imageBuffer);
+      // Используем Promise.all для параллельной загрузки (оптимизация!)
+      await Promise.all(
+        images.map(async (imageUrl, i) => {
+          const imagePath = join(tempDir, `image_${String(i).padStart(3, '0')}.png`);
+          try {
+            await this.downloadFile(imageUrl, imagePath, session);
+            imagePaths[i] = imagePath;
+          } catch (error) {
+            this.logger.error(`[${session}] Error processing image ${i}:`, error);
           }
-          imagePaths.push(imagePath);
-        } catch (error) {
-          this.logger.error(`Error processing image ${i}:`, error);
-          continue;
-        }
-      }
+        })
+      );
 
-      if (imagePaths.length === 0) {
+      // Фильтруем только успешно загруженные изображения
+      const validImagePaths = imagePaths.filter(Boolean);
+
+      if (validImagePaths.length === 0) {
         throw new Error('No images were processed successfully');
       }
 
-      this.logger.log(`[${sessionId}] Processed ${imagePaths.length} images successfully`);
+      this.logger.log(`[${session}] Processed ${validImagePaths.length} images successfully`);
 
+      // Создаём concat файл для FFmpeg
       const filelistPath = join(tempDir, 'filelist.txt');
-      const imageDuration = duration / imagePaths.length;
+      const imageDuration = duration / validImagePaths.length;
       let filelistContent = '';
 
-      for (let i = 0; i < imagePaths.length; i++) {
-        const normalizedPath = imagePaths[i].replace(/\\/g, '/');
+      for (let i = 0; i < validImagePaths.length; i++) {
+        const normalizedPath = validImagePaths[i].replace(/\\/g, '/');
         filelistContent += `file '${normalizedPath}'\n`;
         filelistContent += `duration ${imageDuration.toFixed(3)}\n`;
       }
-      const lastImagePath = imagePaths[imagePaths.length - 1].replace(/\\/g, '/');
+      const lastImagePath = validImagePaths[validImagePaths.length - 1].replace(/\\/g, '/');
       filelistContent += `file '${lastImagePath}'\n`;
 
       await writeFile(filelistPath, filelistContent);
-      this.logger.log(`[${sessionId}] Created concat file with ${imagePaths.length} images, ${imageDuration.toFixed(2)}s each`);
+      this.logger.log(`[${session}] Created concat file with ${validImagePaths.length} images, ${imageDuration.toFixed(2)}s each`);
 
       const outputPath = join(tempDir, 'output.mp4');
 
-      this.logger.log(`[${sessionId}] Starting FFmpeg render...`);
+      this.logger.log(`[${session}] Starting FFmpeg render...`);
 
+      // Рендеринг видео с оптимизированными настройками
       await new Promise<void>((resolve, reject) => {
         ffmpeg()
           .input(filelistPath)
@@ -302,54 +343,56 @@ export class VideoService {
           .input(audioPath)
           .outputOptions([
             '-c:v', 'libx264',
-            '-preset', 'medium',
+            '-preset', 'faster', // Быстрее чем 'medium', но хорошее качество
             '-tune', 'stillimage',
+            '-crf', '23', // Качество (18-28, где 23 = хороший баланс)
             '-c:a', 'aac',
-            '-b:a', '192k',
+            '-b:a', '128k', // Снизили с 192k (экономия размера)
             '-pix_fmt', 'yuv420p',
             '-vf', 'scale=1280:1080:force_original_aspect_ratio=decrease,pad=1280:1080:(ow-iw)/2:(oh-ih)/2',
             '-shortest',
-            '-movflags', '+faststart',
+            '-movflags', '+faststart', // Оптимизация для веб-плеера
           ])
           .output(outputPath)
           .on('start', (commandLine) => {
-            this.logger.log(`[${sessionId}] FFmpeg command: ${commandLine}`);
+            this.logger.log(`[${session}] FFmpeg command: ${commandLine}`);
           })
           .on('progress', (progress) => {
             if (progress.percent) {
-              this.logger.log(`[${sessionId}] Processing: ${progress.percent.toFixed(1)}% done`);
+              this.logger.log(`[${session}] Processing: ${progress.percent.toFixed(1)}% done`);
             }
           })
           .on('end', () => {
-            this.logger.log(`[${sessionId}] FFmpeg render completed`);
+            this.logger.log(`[${session}] FFmpeg render completed`);
             resolve();
           })
           .on('error', (err) => {
-            this.logger.error(`[${sessionId}] FFmpeg error:`, err);
+            this.logger.error(`[${session}] FFmpeg error:`, err);
             reject(err);
           })
           .run();
       });
 
-      this.logger.log(`[${sessionId}] Reading output file...`);
+      this.logger.log(`[${session}] Reading output file...`);
       const videoBuffer = await readFile(outputPath);
       const videoBase64 = videoBuffer.toString('base64');
 
-      this.logger.log(`[${sessionId}] Video size: ${(videoBuffer.length / 1024 / 1024).toFixed(2)} MB`);
+      this.logger.log(`[${session}] Video size: ${(videoBuffer.length / 1024 / 1024).toFixed(2)} MB`);
 
-      this.logger.log(`[${sessionId}] Cleaning up...`);
+      // Cleanup
+      this.logger.log(`[${session}] Cleaning up...`);
       try {
         await unlink(audioPath);
         await unlink(filelistPath);
         await unlink(outputPath);
-        for (const path of imagePaths) {
-          await unlink(path);
+        for (const path of validImagePaths) {
+          if (path) await unlink(path);
         }
       } catch (cleanupError) {
-        this.logger.error(`[${sessionId}] Cleanup error:`, cleanupError);
+        this.logger.error(`[${session}] Cleanup error:`, cleanupError);
       }
 
-      this.logger.log(`[${sessionId}] Render complete!`);
+      this.logger.log(`[${session}] Render complete!`);
 
       return {
         video: videoBase64,
@@ -357,8 +400,25 @@ export class VideoService {
         size: videoBuffer.length,
       };
     } catch (error) {
-      this.logger.error(`[${sessionId}] Render error:`, error);
+      this.logger.error(`[${session}] Render error:`, error);
       throw error;
+    }
+  }
+
+  /**
+   * Вспомогательный метод для загрузки файлов
+   */
+  private async downloadFile(url: string, outputPath: string, sessionId: string): Promise<void> {
+    if (this.isDataUrl(url)) {
+      const buffer = this.decodeDataUrl(url);
+      await writeFile(outputPath, buffer);
+    } else {
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`Failed to download file: ${response.status}`);
+      }
+      const buffer = Buffer.from(await response.arrayBuffer());
+      await writeFile(outputPath, buffer);
     }
   }
 

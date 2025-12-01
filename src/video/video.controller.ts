@@ -81,14 +81,14 @@ export class VideoController {
     }
   }
 
+  /**
+   * ОПТИМИЗИРОВАННЫЙ эндпоинт: рендеринг видео по ID
+   * Принимает только videoId, все данные загружаются из Supabase
+   */
   @Post('render-video')
   async renderVideo(@Body() dto: RenderVideoDto) {
     try {
-      const result = await this.videoService.renderVideo(
-        dto.audioUrl,
-        dto.images,
-        dto.duration,
-      );
+      const result = await this.videoService.renderVideoById(dto.videoId);
       return result;
     } catch (error) {
       console.error('Video rendering error:', error);
