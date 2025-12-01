@@ -21,10 +21,16 @@ export class VideoService {
   constructor(private configService: ConfigService) {
     // Инициализация Supabase клиента
     const supabaseUrl = this.configService.get<string>('SUPABASE_URL');
-    const supabaseKey = this.configService.get<string>('SUPABASE_KEY');
+    // Пробуем сначала SUPABASE_KEY, потом SUPABASE_SERVICE_ROLE_KEY для обратной совместимости
+    const supabaseKey = 
+      this.configService.get<string>('SUPABASE_KEY') || 
+      this.configService.get<string>('SUPABASE_SERVICE_ROLE_KEY');
     
     if (supabaseUrl && supabaseKey) {
       this.supabase = createClient(supabaseUrl, supabaseKey);
+      this.logger.log('✅ Supabase client initialized');
+    } else {
+      this.logger.warn('⚠️ Supabase not configured - SUPABASE_URL or SUPABASE_KEY missing');
     }
   }
 
