@@ -19,9 +19,7 @@ export class VideoService {
   private supabase;
 
   constructor(private configService: ConfigService) {
-    // Инициализация Supabase клиента
     const supabaseUrl = this.configService.get<string>('SUPABASE_URL');
-    // Пробуем сначала SUPABASE_KEY, потом SUPABASE_SERVICE_ROLE_KEY для обратной совместимости
     const supabaseKey = 
       this.configService.get<string>('SUPABASE_KEY') || 
       this.configService.get<string>('SUPABASE_SERVICE_ROLE_KEY');
@@ -101,20 +99,14 @@ export class VideoService {
           },
           voice: {
             languageCode: 'en-US',
-            name: 'en-US-Neural2-F', // Женский голос, естественный
-            // Другие варианты:
-            // en-US-Neural2-D - Мужской, уверенный
-            // en-US-Neural2-C - Женский, профессиональный
-            // en-US-Neural2-A - Мужской, энергичный
-            // en-GB-Neural2-A - Британский женский
-            // en-GB-Neural2-B - Британский мужской
-            ssmlGender: 'FEMALE', // MALE или FEMALE
+            name: 'en-US-Neural2-F',
+            ssmlGender: 'FEMALE',
           },
           audioConfig: {
             audioEncoding: 'MP3',
-            speakingRate: 1.0, // 0.25-4.0 (скорость речи)
-            pitch: 0.0,        // -20.0 to 20.0 (тон)
-            volumeGainDb: 0.0, // -96.0 to 16.0 (громкость)
+            speakingRate: 1.0,
+            pitch: 0.0,
+            volumeGainDb: 0.0,
           },
         }),
       },
@@ -131,7 +123,6 @@ export class VideoService {
       throw new Error('No audio content in response');
     }
 
-    // Google возвращает base64 напрямую
     const audioBase64 = data.audioContent;
 
     this.logger.log(`Audio generated successfully: ${(audioBase64.length * 0.75 / 1024).toFixed(2)} KB`);
@@ -251,8 +242,7 @@ export class VideoService {
   }
 
   /**
-   * ОПТИМИЗИРОВАННЫЙ МЕТОД: Рендеринг видео по ID
-   * Загружает данные из Supabase вместо получения их в запросе
+   * 🔧 ИСПРАВЛЕННЫЙ МЕТОД: Рендеринг видео по ID с поддержкой субтитров
    */
   async renderVideoById(videoId: string): Promise<{ video: string; contentType: string; size: number }> {
     const sessionId = uuidv4();
@@ -276,13 +266,14 @@ export class VideoService {
         throw new Error(`Video not found: ${videoId}`);
       }
 
-      this.logger.log(`[${sessionId}] Video data loaded: ${videoData.image_list?.length || 0} images, ${videoData.duration}s`);
+      this.logger.log(`[${sessionId}] Video data loaded: ${videoData.image_list?.length || 0} images, show_captions: ${videoData.show_captions}`);
 
-      // Вызываем стандартный метод рендеринга с данными из БД
+      // 🔧 ИСПРАВЛЕНИЕ: Передаем captions и show_captions в метод рендеринга
       return await this.renderVideo(
         videoData.audio_file_url,
         videoData.image_list || [],
-        videoData.duration || 30,
+        videoData.captions || [], // ✅ Передаем субтитры
+        videoData.show_captions !== false, // ✅ Передаем флаг (по умолчанию true)
         sessionId,
       );
     } catch (error) {
@@ -292,19 +283,20 @@ export class VideoService {
   }
 
   /**
-   * Стандартный метод рендеринга (для обратной совместимости)
+   * 🔧 ИСПРАВЛЕННЫЙ МЕТОД: Рендеринг с субтитрами и правильной длительностью
    */
   async renderVideo(
     audioUrl: string,
     images: string[],
-    duration: number,
+    captions: any[], // ✅ Добавлен параметр
+    showCaptions: boolean = true, // ✅ Добавлен параметр
     sessionId?: string,
   ): Promise<{ video: string; contentType: string; size: number }> {
     const session = sessionId || uuidv4();
     const tempDir = join(os.tmpdir(), `video-${session}`);
 
     try {
-      this.logger.log(`[${session}] Starting render: ${images.length} images, ${duration}s duration`);
+      this.logger.log(`[${session}] Starting render: ${images.length} images, captions: ${showCaptions}`);
 
       if (!existsSync(tempDir)) {
         await mkdir(tempDir, { recursive: true });
@@ -315,11 +307,14 @@ export class VideoService {
       const audioPath = join(tempDir, 'audio.mp3');
       await this.downloadFile(audioUrl, audioPath, session);
 
+      // 🔧 ИСПРАВЛЕНИЕ: Получаем РЕАЛЬНУЮ длительность аудио
+      const audioDuration = await this.getAudioDuration(audioPath, session);
+      this.logger.log(`[${session}] Audio duration: ${audioDuration.toFixed(2)}s`);
+
       // Обработка изображений
       this.logger.log(`[${session}] Processing ${images.length} images...`);
       const imagePaths: string[] = [];
 
-      // Используем Promise.all для параллельной загрузки (оптимизация!)
       await Promise.all(
         images.map(async (imageUrl, i) => {
           const imagePath = join(tempDir, `image_${String(i).padStart(3, '0')}.png`);
@@ -332,7 +327,6 @@ export class VideoService {
         })
       );
 
-      // Фильтруем только успешно загруженные изображения
       const validImagePaths = imagePaths.filter(Boolean);
 
       if (validImagePaths.length === 0) {
@@ -343,7 +337,8 @@ export class VideoService {
 
       // Создаём concat файл для FFmpeg
       const filelistPath = join(tempDir, 'filelist.txt');
-      const imageDuration = duration / validImagePaths.length;
+      // 🔧 ИСПРАВЛЕНИЕ: Используем РЕАЛЬНУЮ длительность аудио
+      const imageDuration = audioDuration / validImagePaths.length;
       let filelistContent = '';
 
       for (let i = 0; i < validImagePaths.length; i++) {
@@ -357,28 +352,56 @@ export class VideoService {
       await writeFile(filelistPath, filelistContent);
       this.logger.log(`[${session}] Created concat file with ${validImagePaths.length} images, ${imageDuration.toFixed(2)}s each`);
 
+      // 🔧 НОВОЕ: Генерация SRT файла для субтитров (если включены)
+      let subtitlesPath: string | null = null;
+      if (showCaptions && captions && captions.length > 0) {
+        subtitlesPath = join(tempDir, 'subtitles.srt');
+        await this.generateSrtFile(captions, subtitlesPath);
+        this.logger.log(`[${session}] Generated SRT file with ${captions.length} captions`);
+      }
+
       const outputPath = join(tempDir, 'output.mp4');
 
       this.logger.log(`[${session}] Starting FFmpeg render...`);
 
-      // Рендеринг видео с оптимизированными настройками
+      // 🔧 ИСПРАВЛЕНИЕ: Рендеринг с субтитрами
       await new Promise<void>((resolve, reject) => {
-        ffmpeg()
+        const ffmpegCommand = ffmpeg()
           .input(filelistPath)
           .inputOptions(['-f', 'concat', '-safe', '0'])
-          .input(audioPath)
-          .outputOptions([
-            '-c:v', 'libx264',
-            '-preset', 'faster', // Быстрее чем 'medium', но хорошее качество
-            '-tune', 'stillimage',
-            '-crf', '23', // Качество (18-28, где 23 = хороший баланс)
-            '-c:a', 'aac',
-            '-b:a', '128k', // Снизили с 192k (экономия размера)
-            '-pix_fmt', 'yuv420p',
-            '-vf', 'scale=1280:1080:force_original_aspect_ratio=decrease,pad=1280:1080:(ow-iw)/2:(oh-ih)/2',
-            '-shortest',
-            '-movflags', '+faststart', // Оптимизация для веб-плеера
-          ])
+          .input(audioPath);
+
+        // Базовые опции вывода
+        const outputOptions = [
+          '-c:v', 'libx264',
+          '-preset', 'faster',
+          '-tune', 'stillimage',
+          '-crf', '23',
+          '-c:a', 'aac',
+          '-b:a', '128k',
+          '-pix_fmt', 'yuv420p',
+          '-shortest',
+          '-movflags', '+faststart',
+        ];
+
+        // 🔧 НОВОЕ: Добавляем субтитры через фильтр (если включены)
+        if (subtitlesPath) {
+          // Нормализуем путь для FFmpeg (Windows compatibility)
+          const normalizedSubPath = subtitlesPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+          outputOptions.push(
+            '-vf',
+            `scale=1280:1080:force_original_aspect_ratio=decrease,pad=1280:1080:(ow-iw)/2:(oh-ih)/2,subtitles='${normalizedSubPath}':force_style='FontName=Arial,FontSize=24,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=3,Outline=2,Shadow=1,MarginV=50'`
+          );
+        } else {
+          // Без субтитров - просто масштабирование
+          outputOptions.push(
+            '-vf',
+            'scale=1280:1080:force_original_aspect_ratio=decrease,pad=1280:1080:(ow-iw)/2:(oh-ih)/2'
+          );
+        }
+
+        ffmpegCommand
+          .outputOptions(outputOptions)
           .output(outputPath)
           .on('start', (commandLine) => {
             this.logger.log(`[${session}] FFmpeg command: ${commandLine}`);
@@ -411,6 +434,7 @@ export class VideoService {
         await unlink(audioPath);
         await unlink(filelistPath);
         await unlink(outputPath);
+        if (subtitlesPath) await unlink(subtitlesPath);
         for (const path of validImagePaths) {
           if (path) await unlink(path);
         }
@@ -429,6 +453,56 @@ export class VideoService {
       this.logger.error(`[${session}] Render error:`, error);
       throw error;
     }
+  }
+
+  /**
+   * 🆕 НОВЫЙ МЕТОД: Получение длительности аудио файла
+   */
+  private async getAudioDuration(audioPath: string, sessionId: string): Promise<number> {
+    return new Promise((resolve, reject) => {
+      ffmpeg.ffprobe(audioPath, (err, metadata) => {
+        if (err) {
+          this.logger.error(`[${sessionId}] Error getting audio duration:`, err);
+          reject(err);
+          return;
+        }
+
+        const duration = metadata.format.duration || 30;
+        resolve(duration);
+      });
+    });
+  }
+
+  /**
+   * 🆕 НОВЫЙ МЕТОД: Генерация SRT файла из субтитров
+   */
+  private async generateSrtFile(captions: any[], outputPath: string): Promise<void> {
+    let srtContent = '';
+    
+    for (let i = 0; i < captions.length; i++) {
+      const caption = captions[i];
+      const startTime = this.formatSrtTime(caption.start);
+      const endTime = this.formatSrtTime(caption.end);
+      
+      srtContent += `${i + 1}\n`;
+      srtContent += `${startTime} --> ${endTime}\n`;
+      srtContent += `${caption.text}\n\n`;
+    }
+
+    await writeFile(outputPath, srtContent, 'utf-8');
+  }
+
+  /**
+   * 🆕 НОВЫЙ МЕТОД: Форматирование времени в SRT формат (00:00:00,000)
+   */
+  private formatSrtTime(milliseconds: number): string {
+    const totalSeconds = Math.floor(milliseconds / 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    const ms = milliseconds % 1000;
+
+    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
   }
 
   /**
